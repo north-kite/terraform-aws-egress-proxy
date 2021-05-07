@@ -294,7 +294,7 @@ resource "aws_s3_bucket_object" "ecs_squid_conf" {
 }
 
 
-data template_file "ecs_whitelists" {
+data "template_file" "ecs_whitelists" {
   count    = length(local.whitelists)
   template = file("config/whitelist_${local.whitelists[count.index]}.tpl")
 
