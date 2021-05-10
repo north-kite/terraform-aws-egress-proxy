@@ -2,8 +2,6 @@
 name: Terraform Module
 on:
   pull_request:
-    paths:
-      - '**.tf'
     types:
       - opened
       - reopened
