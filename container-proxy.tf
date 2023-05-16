@@ -1,4 +1,4 @@
-data "aws_iam_policy_document" "container_internet_proxy_read_config" {
+data "aws_iam_policy_document" "egress_proxy_read_config_files" {
   statement {
     effect = "Allow"
 
@@ -7,7 +7,7 @@ data "aws_iam_policy_document" "container_internet_proxy_read_config" {
     ]
 
     resources = [
-      data.terraform_remote_state.management.outputs.config_bucket.arn,
+      var.config_bucket.arn,
     ]
   }
 
@@ -19,7 +19,7 @@ data "aws_iam_policy_document" "container_internet_proxy_read_config" {
     ]
 
     resources = [
-      "${data.terraform_remote_state.management.outputs.config_bucket.arn}/${local.ecs_squid_config_s3_main_prefix}/*",
+      "${var.config_bucket.arn}/${var.squid_config_s3_main_prefix}/*",
     ]
   }
 
@@ -31,46 +31,73 @@ data "aws_iam_policy_document" "container_internet_proxy_read_config" {
     ]
 
     resources = [
-      data.terraform_remote_state.management.outputs.config_bucket.cmk_arn,
+      var.kms_key,
     ]
   }
 }
 
-resource "aws_iam_role" "container_internet_proxy" {
-  name               = "InternetProxy"
-  assume_role_policy = data.terraform_remote_state.management.outputs.ecs_assume_role_policy_json
-  tags               = local.common_tags
+data "aws_iam_policy_document" "ecs_assume_role_policy" {
+  statement {
+    sid     = "EcsAssumeRole"
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["ecs-tasks.amazonaws.com"]
+    }
+  }
 }
 
-resource "aws_iam_role_policy" "container_internet_proxy" {
-  policy = data.aws_iam_policy_document.container_internet_proxy_read_config.json
-  role   = aws_iam_role.container_internet_proxy.id
+resource "aws_iam_role" "egress_proxy" {
+  name               = "${var.service}-${var.env}"
+  assume_role_policy = data.aws_iam_policy_document.ecs_assume_role_policy.json
 }
 
-resource "aws_cloudwatch_log_group" "internet_proxy_ecs" {
-  name              = "/aws/ecs/main/internet-proxy"
+resource "aws_iam_policy" "egress_proxy_read_config_files" {
+  name        = "${var.service}-${var.env}-s3-access-to-config-files"
+  description = "Grants the Egress Proxy access to config files stored in S3"
+  policy      = data.aws_iam_policy_document.egress_proxy_read_config_files.json
+}
+
+resource "aws_iam_role_policy_attachment" "egress_proxy_read_config_files" {
+  policy_arn = aws_iam_policy.egress_proxy_read_config_files.arn
+  role       = aws_iam_role.egress_proxy.name
+}
+
+resource "aws_cloudwatch_log_group" "egress_proxy" {
+  name              = "/aws/ecs/main/${var.env}-internet-proxy"
   retention_in_days = 30
-  tags              = local.common_tags
 }
 
-# Note that the CONTAINER_VERSION environment variable below is just a dummy
-# variable. If you need the ECS service to deploy an updated container version,
-# just change that number (to anything). Future work will put proper version
-# tags on the container image itself, at which point that psuedo-version
-# environment variable can be removed again
-resource "aws_ecs_task_definition" "container_internet_proxy" {
+resource "aws_iam_role" "ecs_task_execution_role" {
+  count              = var.ecs_task_execution_role == null ? 1 : 0
+  name               = "${var.service}-${var.env}-ecs-task-execution"
+  assume_role_policy = data.aws_iam_policy_document.ecs_assume_role_policy.json
+  tags = {
+    Name = "proxy-ecs-task-execution"
+  }
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_task_execution_role" {
+  count      = var.ecs_task_execution_role == null ? 1 : 0
+  role       = aws_iam_role.ecs_task_execution_role[0].name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+resource "aws_ecs_task_definition" "egress_proxy" {
   family                   = "squid-s3"
   network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
   cpu                      = "512"
   memory                   = "4096"
-  task_role_arn            = aws_iam_role.container_internet_proxy.arn
-  execution_role_arn       = data.terraform_remote_state.management.outputs.ecs_task_execution_role.arn
+  task_role_arn            = aws_iam_role.egress_proxy.arn
+  execution_role_arn       = var.ecs_task_execution_role != null ? data.aws_iam_role.ecs_task_execution_role[0].arn : aws_iam_role.ecs_task_execution_role[0].arn
 
   container_definitions = <<DEFINITION
 [
   {
-    "image": "${local.account[local.environment]}.${module.vpc.ecr_dkr_domain_name}/squid-s3:latest",
+    "image": "${var.image}",
     "name": "squid-s3",
     "networkMode": "awsvpc",
     "portMappings": [
@@ -81,7 +108,7 @@ resource "aws_ecs_task_definition" "container_internet_proxy" {
     "logConfiguration": {
       "logDriver": "awslogs",
       "options": {
-        "awslogs-group": "${aws_cloudwatch_log_group.internet_proxy_ecs.name}",
+        "awslogs-group": "${aws_cloudwatch_log_group.egress_proxy.name}",
         "awslogs-region": "${data.aws_region.current.name}",
         "awslogs-stream-prefix": "container-internet-proxy"
       }
@@ -95,23 +122,19 @@ resource "aws_ecs_task_definition" "container_internet_proxy" {
     "environment": [
       {
         "name": "SQUID_CONFIG_S3_BUCKET",
-        "value": "${data.terraform_remote_state.management.outputs.config_bucket.id}"
+        "value": "${var.config_bucket.id}"
       },
       {
         "name": "SQUID_CONFIG_S3_PREFIX",
-        "value": "${local.ecs_squid_config_s3_main_prefix}"
-      },
-      {
-        "name": "CONTAINER_VERSION",
-        "value": "0.0.1"
+        "value": "${var.squid_config_s3_main_prefix}"
       },
       {
         "name": "PROXY_CFG_CHANGE_DEPENDENCY",
-        "value": "${md5(data.template_file.ecs_squid_conf.rendered)}"
+        "value": "${md5(file("${path.module}/config/ecs_squid_conf.tpl"))}"
       },
       {
-        "name": "PROXY_WHITELIST_CHANGE_DEPENDENCY",
-        "value": "${md5(join(",", formatlist("%s", data.template_file.ecs_whitelists[*].rendered)))}"
+        "name": "PROXY_ALLOWLIST_CHANGE_DEPENDENCY",
+        "value": "${md5(jsonencode(var.acl))}"
       }
     ]
   }
@@ -120,193 +143,224 @@ DEFINITION
 
 }
 
-resource "aws_ecs_service" "container_internet_proxy" {
-  name            = "container-internet-proxy"
-  cluster         = data.terraform_remote_state.management.outputs.ecs_cluster_main.id
-  task_definition = aws_ecs_task_definition.container_internet_proxy.arn
-  desired_count   = length(data.aws_availability_zones.available.names)
-  launch_type     = "FARGATE"
+
+resource "aws_ecs_service" "egress_proxy" {
+  name                   = "${var.service}-${var.env}"
+  cluster                = var.ecs_cluster
+  task_definition        = aws_ecs_task_definition.egress_proxy.arn
+  desired_count          = var.size != null ? var.size : length(data.aws_availability_zones.available.names)
+  launch_type            = var.ecs_launch_type
+  enable_execute_command = var.enable_execute_command
 
   network_configuration {
-    security_groups = [aws_security_group.internet_proxy.id]
-    subnets         = aws_subnet.proxy.*.id
+    security_groups = [aws_security_group.egress_proxy.id]
+    subnets         = data.aws_subnet.subnets.*.id
   }
 
   load_balancer {
-    target_group_arn = aws_lb_target_group.container_internet_proxy.arn
+    target_group_arn = aws_lb_target_group.egress_proxy.arn
     container_name   = "squid-s3"
     container_port   = var.proxy_port
   }
 }
 
-resource "aws_acm_certificate" "internet_proxy" {
-  domain_name       = "proxy.${local.dw_domain}"
+resource "aws_acm_certificate" "egress_proxy" {
+  domain_name       = "${var.subdomain}.${var.parent_domain}"
   validation_method = "DNS"
 }
 
 resource "aws_route53_record" "cert_validation" {
-  name     = aws_acm_certificate.internet_proxy.domain_validation_options[0].resource_record_name
-  type     = aws_acm_certificate.internet_proxy.domain_validation_options[0].resource_record_type
-  zone_id  = data.terraform_remote_state.management_dns.outputs.dataworks_zone.id
-  records  = [aws_acm_certificate.internet_proxy.domain_validation_options[0].resource_record_value]
-  ttl      = 60
-  provider = aws.management_dns
+  for_each = {
+    for dvo in aws_acm_certificate.egress_proxy.domain_validation_options : dvo.domain_name => {
+      name   = dvo.resource_record_name
+      record = dvo.resource_record_value
+      type   = dvo.resource_record_type
+    }
+  }
+
+  allow_overwrite = true
+  name            = each.value.name
+  records         = [each.value.record]
+  ttl             = 60
+  type            = each.value.type
+  zone_id         = data.aws_route53_zone.public.id
 }
 
 resource "aws_acm_certificate_validation" "internet_proxy" {
-  certificate_arn         = aws_acm_certificate.internet_proxy.arn
-  validation_record_fqdns = [aws_route53_record.cert_validation.fqdn]
+  certificate_arn         = aws_acm_certificate.egress_proxy.arn
+  validation_record_fqdns = [for record in aws_route53_record.cert_validation : record.fqdn]
 }
 
-resource "aws_lb" "container_internet_proxy" {
-  name               = "container-internet-proxy"
+resource "aws_lb" "egress_proxy" {
+  name               = "${var.service}-${var.env}"
   internal           = true
   load_balancer_type = "network"
-  subnets            = aws_subnet.proxy.*.id
-  tags               = local.common_tags
+  subnets            = data.aws_subnet.subnets.*.id
 
-  access_logs {
-    bucket  = data.terraform_remote_state.security_tools.outputs.logstore_bucket.id
-    prefix  = "ELBLogs/container-internet-proxy"
-    enabled = true
+  dynamic "access_logs" {
+    for_each = var.load_balancer_access_log_bucket_id != null ? [var.load_balancer_access_log_bucket_id] : []
+    content {
+      bucket  = access_logs.value
+      prefix  = "ELBLogs/${var.service}-${var.env}"
+      enabled = true
+    }
   }
 }
 
-resource "aws_lb_target_group" "container_internet_proxy" {
-  name              = "container-internet-proxy"
+resource "aws_lb_target_group" "egress_proxy" {
+  name              = "${var.service}-${var.env}"
   port              = var.proxy_port
   protocol          = "TCP"
   target_type       = "ip"
-  vpc_id            = module.vpc.vpc.id
+  vpc_id            = data.aws_vpc.vpc.id
   proxy_protocol_v2 = true
-
-  stickiness {
-    type    = "lb_cookie"
-    enabled = false
-  }
 
   lifecycle {
     create_before_destroy = true
   }
 
-  tags = merge(
-    local.common_tags,
-    { Name = "container-internet-proxy" },
-  )
+  tags = {
+    Name = "${var.service}-${var.env}"
+  }
 }
 
-resource "aws_lb_listener" "container_internet_proxy" {
-  load_balancer_arn = aws_lb.container_internet_proxy.arn
+resource "aws_lb_listener" "egress_proxy" {
+  load_balancer_arn = aws_lb.egress_proxy.arn
   port              = var.proxy_port
   protocol          = "TCP"
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.container_internet_proxy.arn
+    target_group_arn = aws_lb_target_group.egress_proxy.arn
   }
 }
 
-resource "aws_lb_listener" "container_internet_proxy_tls" {
-  load_balancer_arn = aws_lb.container_internet_proxy.arn
+resource "aws_lb_listener" "egress_proxy_tls" {
+  load_balancer_arn = aws_lb.egress_proxy.arn
   port              = 443
   protocol          = "TLS"
   ssl_policy        = "ELBSecurityPolicy-FS-1-2-Res-2019-08"
-  certificate_arn   = aws_acm_certificate.internet_proxy.arn
+  certificate_arn   = aws_acm_certificate.egress_proxy.arn
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.container_internet_proxy.arn
+    target_group_arn = aws_lb_target_group.egress_proxy.arn
   }
 
   depends_on = [aws_acm_certificate_validation.internet_proxy]
 }
 
-resource "aws_security_group" "internet_proxy" {
-  name   = "internet-proxy"
-  vpc_id = module.vpc.vpc.id
+resource "aws_security_group" "egress_proxy" {
+  name   = "${var.env}-internet-proxy"
+  vpc_id = data.aws_vpc.vpc.id
 }
 
-resource "aws_security_group_rule" "internet_proxy" {
-  description       = "Internet proxy users"
+resource "aws_security_group_rule" "egress_proxy_ingress" {
+  description       = "Egress proxy users"
   type              = "ingress"
-  cidr_blocks       = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+  cidr_blocks       = var.ingress_network_access
   protocol          = "tcp"
   from_port         = var.proxy_port
   to_port           = var.proxy_port
-  security_group_id = aws_security_group.internet_proxy.id
+  security_group_id = aws_security_group.egress_proxy.id
 }
 
 resource "aws_security_group_rule" "ecs_to_s3" {
+  count             = var.use_s3_vpc_endpoint ? 1 : 0
   description       = "Allow ECS to reach S3 (for Docker pull from ECR)"
   type              = "egress"
-  prefix_list_ids   = [module.vpc.prefix_list_ids.s3]
+  prefix_list_ids   = [data.aws_vpc_endpoint.s3[0].prefix_list_id]
   protocol          = "tcp"
   from_port         = 443
   to_port           = 443
-  security_group_id = aws_security_group.internet_proxy.id
+  security_group_id = aws_security_group.egress_proxy.id
 }
 
-resource "aws_security_group_rule" "internet_proxy_to_internet_https" {
-  description       = "Allow Internet Proxy to reach all Internet hosts (HTTPS)"
+resource "aws_security_group_rule" "egress_proxy_egress" {
+  for_each = { for v in var.egress_network_ports : v => v }
+
+  description       = "Allow Egress Proxy out to port ${each.key}"
   type              = "egress"
-  cidr_blocks       = ["0.0.0.0/0"]
+  cidr_blocks       = var.egress_network_access
   protocol          = "tcp"
-  from_port         = 443
-  to_port           = 443
-  security_group_id = aws_security_group.internet_proxy.id
-}
-
-resource "aws_security_group_rule" "internet_proxy_to_internet_http" {
-  description       = "Allow Internet Proxy to reach all Internet hosts (HTTP)"
-  type              = "egress"
-  cidr_blocks       = ["0.0.0.0/0"]
-  protocol          = "tcp"
-  from_port         = 80
-  to_port           = 80
-  security_group_id = aws_security_group.internet_proxy.id
-}
-
-data "template_file" "ecs_squid_conf" {
-  template = file("config/ecs_squid_conf.tpl")
-
-  vars = {
-    environment = local.environment
-
-    cidr_block_packer_mgmtdev          = local.host_ranges.management-dev.packer-vpc
-    cidr_block_ci_cd_mgmtdev           = local.host_ranges.management-dev.ci-cd-vpc
-    cidr_block_internet_egress_mgmtdev = local.cidr_block.management-dev
-
-    cidr_block_packer_mgmt          = local.host_ranges.management.packer-vpc
-    cidr_block_ci_cd_mgmt           = local.host_ranges.management.ci-cd-vpc
-    cidr_block_internet_egress_mgmt = local.cidr_block.management
-
-    whitelist_ci_cd_name        = local.whitelist_names.ci_cd
-    whitelist_packer_name       = local.whitelist_names.packer
-    whitelist_aws_services_name = local.whitelist_names.aws_services
-  }
+  from_port         = each.value
+  to_port           = each.value
+  security_group_id = aws_security_group.egress_proxy.id
 }
 
 resource "aws_s3_bucket_object" "ecs_squid_conf" {
-  bucket     = data.terraform_remote_state.management.outputs.config_bucket.id
-  key        = "${local.ecs_squid_config_s3_main_prefix}/${local.squid_conf_filename}"
-  content    = data.template_file.ecs_squid_conf.rendered
-  kms_key_id = data.terraform_remote_state.management.outputs.config_bucket.cmk_arn
+  bucket     = var.config_bucket.id
+  key        = "${var.squid_config_s3_main_prefix}/squid.conf"
+  kms_key_id = var.kms_key
+  content = templatefile("${path.module}/config/ecs_squid_conf.tpl", {
+    acl = {
+      sources      = var.acl.sources
+      destinations = var.acl.destinations
+      rules        = var.acl.rules
+    }
+  })
 }
 
+resource "aws_s3_bucket_object" "ecs_allowlists" {
+  for_each   = var.acl.destinations
+  bucket     = var.config_bucket.id
+  key        = "${var.squid_config_s3_main_prefix}/conf.d/allowlist_${each.key}"
+  content    = each.value
+  kms_key_id = var.kms_key
+}
 
-data "template_file" "ecs_whitelists" {
-  count    = length(local.whitelists)
-  template = file("config/whitelist_${local.whitelists[count.index]}.tpl")
+resource "aws_route53_record" "egress_proxy" {
+  zone_id = data.aws_route53_zone.private.id
+  name    = "${var.subdomain}.${var.parent_domain}"
+  type    = "A"
 
-  vars = {
-    environment = local.environment
+  alias {
+    name                   = aws_lb.egress_proxy.dns_name
+    zone_id                = aws_lb.egress_proxy.zone_id
+    evaluate_target_health = true
   }
 }
 
-resource "aws_s3_bucket_object" "ecs_whitelists" {
-  count      = length(local.whitelists)
-  bucket     = data.terraform_remote_state.management.outputs.config_bucket.id
-  key        = "${local.ecs_squid_config_s3_main_prefix}/conf.d/whitelist_${local.whitelists[count.index]}"
-  content    = data.template_file.ecs_whitelists[count.index].rendered
-  kms_key_id = data.terraform_remote_state.management.outputs.config_bucket.cmk_arn
+resource "aws_route53_record" "egress_proxy_public" {
+  zone_id = data.aws_route53_zone.public.id
+  name    = "${var.subdomain}.${var.parent_domain}"
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.egress_proxy.dns_name
+    zone_id                = aws_lb.egress_proxy.zone_id
+    evaluate_target_health = true
+  }
+}
+
+## ECS Exec Policy
+
+resource "aws_iam_policy" "ecs_ssm_policy" {
+  count = var.enable_execute_command ? 1 : 0
+
+  name        = "${var.service}-${var.env}-ecs-task-role-ssm-policy"
+  description = "Policy allowing ECS execute command on egress proxy container."
+  policy      = data.aws_iam_policy_document.ecs_ssm_policy.json
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_ssm_policy_attachment" {
+  count = var.enable_execute_command ? 1 : 0
+
+  role       = aws_iam_role.egress_proxy.name
+  policy_arn = aws_iam_policy.ecs_ssm_policy[0].arn
+}
+
+data "aws_iam_policy_document" "ecs_ssm_policy" {
+  statement {
+    sid    = "ECSExec"
+    effect = "Allow"
+
+    actions = [
+      "ssmmessages:CreateControlChannel",
+      "ssmmessages:CreateDataChannel",
+      "ssmmessages:OpenControlChannel",
+      "ssmmessages:OpenDataChannel",
+    ]
+    resources = ["*"]
+  }
 }
