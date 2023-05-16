@@ -1,0 +1,9 @@
+---
+name: default
+inputs:
+- name: proxy_address
+  type: string
+- name: proxy_port
+  type: string
+- name: httpbin_host
+  type: string

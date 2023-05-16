@@ -1,0 +1,10 @@
+region          = "eu-west-2"                  # AWS region name
+parent_domain   = "example.com"                # domain with a Route53 Hosted Zone
+vpc_name        = "dev"                        # Name of VPC to deploy proxy to
+env             = "internal-example"           # Environment name , used to uniquely name resources
+container_image = "dwpdigital/squid-s3:latest" # Docker container image registry, name, and tag/hash
+subnet_names = [                               # List of subnet names to deploy the proxy to
+  "dev-public-az-a",
+  "dev-public-az-b",
+  "dev-public-az-c",
+]
