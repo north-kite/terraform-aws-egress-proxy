@@ -1,3 +1,7 @@
+locals {
+  name = var.service == "" ? "${var.env}-${var.role}" : "${var.service}-${var.env}-${var.role}"
+}
+
 data "aws_iam_policy_document" "egress_proxy_read_config_files" {
   statement {
     effect = "Allow"
@@ -50,12 +54,12 @@ data "aws_iam_policy_document" "ecs_assume_role_policy" {
 }
 
 resource "aws_iam_role" "egress_proxy" {
-  name               = "${var.service}-${var.env}"
+  name               = local.name
   assume_role_policy = data.aws_iam_policy_document.ecs_assume_role_policy.json
 }
 
 resource "aws_iam_policy" "egress_proxy_read_config_files" {
-  name        = "${var.service}-${var.env}-s3-access-to-config-files"
+  name        = "${local.name}-s3-access-to-config-files"
   description = "Grants the Egress Proxy access to config files stored in S3"
   policy      = data.aws_iam_policy_document.egress_proxy_read_config_files.json
 }
@@ -66,16 +70,16 @@ resource "aws_iam_role_policy_attachment" "egress_proxy_read_config_files" {
 }
 
 resource "aws_cloudwatch_log_group" "egress_proxy" {
-  name              = "/aws/ecs/main/${var.env}-internet-proxy"
+  name              = "/aws/ecs/main/${local.name}"
   retention_in_days = 30
 }
 
 resource "aws_iam_role" "ecs_task_execution_role" {
   count              = var.ecs_task_execution_role == null ? 1 : 0
-  name               = "${var.service}-${var.env}-ecs-task-execution"
+  name               = "${local.name}-ecs-task-execution"
   assume_role_policy = data.aws_iam_policy_document.ecs_assume_role_policy.json
   tags = {
-    Name = "proxy-ecs-task-execution"
+    Name = "${local.name}-ecs-task-execution"
   }
 }
 
@@ -86,7 +90,7 @@ resource "aws_iam_role_policy_attachment" "ecs_task_execution_role" {
 }
 
 resource "aws_ecs_task_definition" "egress_proxy" {
-  family                   = "squid-s3"
+  family                   = local.name
   network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
   cpu                      = "512"
@@ -98,7 +102,7 @@ resource "aws_ecs_task_definition" "egress_proxy" {
 [
   {
     "image": "${var.image}",
-    "name": "squid-s3",
+    "name": "${var.role}",
     "networkMode": "awsvpc",
     "portMappings": [
       {
@@ -110,7 +114,7 @@ resource "aws_ecs_task_definition" "egress_proxy" {
       "options": {
         "awslogs-group": "${aws_cloudwatch_log_group.egress_proxy.name}",
         "awslogs-region": "${data.aws_region.current.name}",
-        "awslogs-stream-prefix": "container-internet-proxy"
+        "awslogs-stream-prefix": "${local.name}"
       }
     },
     "placementStrategy": [
@@ -145,12 +149,13 @@ DEFINITION
 
 
 resource "aws_ecs_service" "egress_proxy" {
-  name                   = "${var.service}-${var.env}"
+  name                   = local.name
   cluster                = var.ecs_cluster
   task_definition        = aws_ecs_task_definition.egress_proxy.arn
   desired_count          = var.size != null ? var.size : length(data.aws_availability_zones.available.names)
   launch_type            = var.ecs_launch_type
   enable_execute_command = var.enable_execute_command
+  propagate_tags         = "TASK_DEFINITION"
 
   network_configuration {
     security_groups = [aws_security_group.egress_proxy.id]
@@ -159,8 +164,12 @@ resource "aws_ecs_service" "egress_proxy" {
 
   load_balancer {
     target_group_arn = aws_lb_target_group.egress_proxy.arn
-    container_name   = "squid-s3"
+    container_name   = var.role
     container_port   = var.proxy_port
+  }
+
+  tags = {
+    Name = "${local.name}"
   }
 }
 
@@ -205,10 +214,14 @@ resource "aws_lb" "egress_proxy" {
       enabled = true
     }
   }
+
+  tags = {
+    Name = "${local.name}"
+  }
 }
 
 resource "aws_lb_target_group" "egress_proxy" {
-  name              = "${var.service}-${var.env}"
+  name              = local.name
   port              = var.proxy_port
   protocol          = "TCP"
   target_type       = "ip"
@@ -220,7 +233,7 @@ resource "aws_lb_target_group" "egress_proxy" {
   }
 
   tags = {
-    Name = "${var.service}-${var.env}"
+    Name = "${local.name}"
   }
 }
 
@@ -247,12 +260,20 @@ resource "aws_lb_listener" "egress_proxy_tls" {
     target_group_arn = aws_lb_target_group.egress_proxy.arn
   }
 
+  tags = {
+    Name = "${local.name}"
+  }
+
   depends_on = [aws_acm_certificate_validation.internet_proxy]
 }
 
 resource "aws_security_group" "egress_proxy" {
-  name   = "${var.env}-internet-proxy"
+  name   = local.name
   vpc_id = data.aws_vpc.vpc.id
+
+  tags = {
+    Name = "${local.name}"
+  }
 }
 
 resource "aws_security_group_rule" "egress_proxy_ingress" {
@@ -288,7 +309,7 @@ resource "aws_security_group_rule" "egress_proxy_egress" {
   security_group_id = aws_security_group.egress_proxy.id
 }
 
-resource "aws_s3_bucket_object" "ecs_squid_conf" {
+resource "aws_s3_object" "ecs_squid_conf" {
   bucket     = var.config_bucket.id
   key        = "${var.squid_config_s3_main_prefix}/squid.conf"
   kms_key_id = var.kms_key
@@ -301,7 +322,7 @@ resource "aws_s3_bucket_object" "ecs_squid_conf" {
   })
 }
 
-resource "aws_s3_bucket_object" "ecs_allowlists" {
+resource "aws_s3_object" "ecs_allowlists" {
   for_each   = var.acl.destinations
   bucket     = var.config_bucket.id
   key        = "${var.squid_config_s3_main_prefix}/conf.d/allowlist_${each.key}"
@@ -338,9 +359,13 @@ resource "aws_route53_record" "egress_proxy_public" {
 resource "aws_iam_policy" "ecs_ssm_policy" {
   count = var.enable_execute_command ? 1 : 0
 
-  name        = "${var.service}-${var.env}-ecs-task-role-ssm-policy"
+  name        = "${local.name}-ecs-task-role-ssm-policy"
   description = "Policy allowing ECS execute command on egress proxy container."
   policy      = data.aws_iam_policy_document.ecs_ssm_policy.json
+
+  tags = {
+    Name = "${local.name}-ecs-task-role-ssm-policy"
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "ecs_ssm_policy_attachment" {

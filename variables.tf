@@ -52,6 +52,12 @@ variable "kms_key" {
 variable "service" {
   description = "(Optional) Service name, used in resource names"
   type        = string
+  default     = ""
+}
+
+variable "role" {
+  description = "(Optional) Used to segment instantiations of the same project egress in an account, used in resource names"
+  type        = string
   default     = "egress-proxy"
 }
 
